@@ -209,10 +209,10 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	host := parsed.Hostname()
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-	h3RoundTripper := &http3.RoundTripper{
+	h3Transport := &http3.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
-	h3Client := &http.Client{Transport: h3RoundTripper, Timeout: 3 * time.Second}
+	h3Client := &http.Client{Transport: h3Transport, Timeout: 3 * time.Second}
 	reqH3, _ := http.NewRequest("HEAD", target, nil)
 	reqH3.Header.Set("User-Agent", userAgent)
 	respH3, errH3 := h3Client.Do(reqH3)
@@ -222,7 +222,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 		}
 		respH3.Body.Close()
 	}
-	h3RoundTripper.Close()
 
 	h2Transport := &http2.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
@@ -370,7 +369,7 @@ func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 
 func buildHTTP3Client(config *workerConfig) *http.Client {
 	return &http.Client{
-		Transport: &http3.RoundTripper{
+		Transport: &http3.Transport{
 			TLSClientConfig:    &tls.Config{InsecureSkipVerify: config.insecureTLS, ServerName: randomSNI(config.targetURL)},
 			DisableCompression: false,
 		},

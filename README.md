@@ -33,11 +33,9 @@
 1.  **Go**: You must have Go installed and configured on your system (version 1.18 or newer recommended). Download it from [golang.org](https://golang.org/).
 2.  Install dependencies:
     ```bash
-    go get github.com/fatih/color
-    go get golang.org/x/net/http2
-    go get github.com/quic-go/quic-go/http3
-    go get github.com/refraction-networking/utls
-    go get github.com/quic-go/quic-go@v0.37.6   (IMPORTANT, if you encounter quic-go or http3 error when compiling)
+    download the file pv_http_pro.go
+    go mod init pv_http_pro.go
+    go mod tidy
     ```
 
 -----
