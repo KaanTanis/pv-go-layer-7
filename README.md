@@ -35,6 +35,8 @@
   - MadeYouReset statistics
   - Live event log
 
+  ![image](https://raw.githubusercontent.com/pinoyvendetta/pv-go-layer-7/refs/heads/main/img/pv-go-l7.png)
+
 ## Requirements
 
 - Go 1.18+
@@ -139,6 +141,10 @@ The terminal dashboard displays:
 - Error statistics
 - MadeYouReset counters
 - Recent log messages
+
+## Cloudflare 403 Response Bypass ✅
+
+![image](https://raw.githubusercontent.com/pinoyvendetta/pv-go-layer-7/refs/heads/main/img/cf-bypass.png)
 
 ## Notes
 
