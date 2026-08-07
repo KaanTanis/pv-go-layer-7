@@ -2,7 +2,7 @@
 
 ## Overview
 
-**pv_http_pro** is a Go-based Layer 7 HTTP load and resilience testing tool intended for **authorized** testing of web infrastructure. It automatically detects supported HTTP versions (HTTP/1.1, HTTP/2 and HTTP/3) or allows them to be forced manually, distributing workers across protocols to simulate diverse client traffic.
+**pv_http** is a Go-based Layer 7 HTTP load and resilience testing tool intended for **authorized** testing of web infrastructure. It automatically detects supported HTTP versions (HTTP/1.1, HTTP/2 and HTTP/3) or allows them to be forced manually, distributing workers across protocols to simulate diverse client traffic.
 
 ## Features
 
@@ -44,20 +44,20 @@
 ## Installation
 
 ```bash
-go mod init pv_http_pro
+go mod init pv_http
 go mod tidy
 ```
 
 ## Build
 
 ```bash
-go build pv_http_pro.go
+go build pv_http.go
 ```
 
 ## Usage
 
 ```bash
-./pv_http_pro --url https://example.com [OPTIONS]
+./pv_http --url https://example.com [OPTIONS]
 ```
 
 ## Command-line Flags
@@ -93,37 +93,37 @@ go build pv_http_pro.go
 Basic:
 
 ```bash
-./pv_http_pro --url https://example.com
+./pv_http --url https://example.com
 ```
 
 HTTP/2 only:
 
 ```bash
-./pv_http_pro --url https://example.com --http-protocol 2
+./pv_http --url https://example.com --http-protocol 2
 ```
 
 HTTP/2 + HTTP/3:
 
 ```bash
-./pv_http_pro --url https://example.com --http-protocol 2,3
+./pv_http --url https://example.com --http-protocol 2,3
 ```
 
 POST workload:
 
 ```bash
-./pv_http_pro --url https://example.com/login --http-method POST
+./pv_http --url https://example.com/login --http-method POST
 ```
 
 Adaptive delay:
 
 ```bash
-./pv_http_pro --url https://example.com --adaptive-delay=true
+./pv_http --url https://example.com --adaptive-delay=true
 ```
 
 Random cache-bypass parameters:
 
 ```bash
-./pv_http_pro --url https://example.com --random-path=true
+./pv_http --url https://example.com --random-path=true
 ```
 
 ## Dashboard
